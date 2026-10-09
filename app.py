@@ -157,7 +157,20 @@ async def startup_event():
         for r in records:
             p = r.payload
             if p:
-                text_doc = f"{p.get('ProductName','')} {p.get('ProductFunction','')} {p.get('CategoryName','')} {p.get('Tags','')} {p.get('class_name','')} {p.get('ColorName','')} {p.get('ProductVolume','')}ml"
+                text_doc = (
+                    f"{p.get('Type', '')} "
+                    f"{p.get('ProductName', '')} "
+                    f"{p.get('ProductNeck', '')} "
+                    f"{p.get('ProductFunction', '')} "
+                    f"{p.get('Weight', '')} "
+                    f"{p.get('Length', '')} "
+                    f"{p.get('Width', '')} "
+                    f"{p.get('Height', '')} "
+                    f"{p.get('ProductVolume', '')} "
+                    f"{p.get('CategoryName', '')} "
+                    f"{p.get('ColorName', '')} "
+                    f"{p.get('Tags', '')} "
+                ).strip()
                 db_metadata_docs.append(text_doc.lower())
                 db_qdrant_ids.append(r.id)
                 db_payloads.append(p)
