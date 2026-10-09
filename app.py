@@ -33,7 +33,7 @@ YOLO_MODEL_NAME = "yolo26m-seg.pt"
 
 TBIR_MODEL_NAME = "google/siglip-base-patch16-224"
 
-QDRANT_PATH = "bottle-recommendation-qdrant_temp"
+QDRANT_PATH = "bottle-recommendation-qdrant"
 COLLECTION_NAME = "bottle_collection_storage"
 FINAL_K = 10
 
