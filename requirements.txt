@@ -4,10 +4,11 @@ pydantic
 python-multipart
 numpy
 opencv-python
-torch
-ultralytics
-transformers
-fastembed
-sentencepiece
 scikit-learn
+xgboost
+torch
+transformers
+sentence-transformers
+rank-bm25
+ultralytics
 qdrant-client
