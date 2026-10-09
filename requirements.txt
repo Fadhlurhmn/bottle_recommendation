@@ -1,0 +1,13 @@
+fastapi
+uvicorn
+pydantic
+python-multipart
+numpy
+opencv-python
+torch
+ultralytics
+transformers
+fastembed
+sentencepiece
+scikit-learn
+qdrant-client
