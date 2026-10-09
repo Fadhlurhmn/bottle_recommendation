@@ -15,7 +15,9 @@ import uvicorn
 
 from sklearn.linear_model import LogisticRegression
 from sklearn.preprocessing import LabelEncoder
-from fastembed import TextEmbedding, SparseTextEmbedding
+import xgboost as xgb
+from rank_bm25 import BM25Okapi
+from sentence_transformers import SentenceTransformer
 from ultralytics import YOLO
 from transformers import AutoModel, AutoProcessor, AutoTokenizer
 from qdrant_client import QdrantClient
@@ -31,8 +33,8 @@ YOLO_MODEL_NAME = "yolo26m-seg.pt"
 
 TBIR_MODEL_NAME = "google/siglip-base-patch16-224"
 
-QDRANT_PATH = "qdrant_bottle_recommendation"
-COLLECTION_NAME = "bottle_collection"
+QDRANT_PATH = "bottle-recommendation-qdrant_temp"
+COLLECTION_NAME = "bottle_collection_storage"
 FINAL_K = 10
 
 INPUT_SIZE = 224
@@ -58,15 +60,19 @@ dino_model = None
 tbir_tokenizer = None
 tbir_model = None
 qdrant_client = None
-lr_clf = None
+xgb_clf = None
 label_encoder = None
 e5_model = None
-sparse_model = None
+db_metadata_docs = []
+db_qdrant_ids = []
+db_payloads = []
+bm25_index = None
+e5_vectors = None
 
 @app.on_event("startup")
 async def startup_event():
-    global yolo_model, dino_model, tbir_tokenizer, tbir_model, qdrant_client, lr_clf, label_encoder
-    global e5_model, sparse_model
+    global yolo_model, dino_model, tbir_tokenizer, tbir_model, qdrant_client, xgb_clf, label_encoder
+    global e5_model, db_metadata_docs, db_qdrant_ids, db_payloads, bm25_index, e5_vectors
 
     print("[STARTUP] Loading YOLO Segmentation...")
     yolo_model = YOLO(YOLO_MODEL_NAME)
@@ -83,12 +89,12 @@ async def startup_event():
     print(f"[STARTUP] Connecting to Qdrant di {QDRANT_PATH}...")
     qdrant_client = QdrantClient(path=QDRANT_PATH)
 
-    print("[STARTUP] Loading Logistic Regression Reranker...")
+    print("[STARTUP] Loading XGBoost Reranker...")
     try:
-        with open("lr_reranker.pkl", "rb") as f:
-            lr_clf, label_encoder = pickle.load(f)
+        with open("xgb_reranker.pkl", "rb") as f:
+            xgb_clf, label_encoder = pickle.load(f)
     except Exception:
-        print("[STARTUP] lr_reranker.pkl tidak ditemukan. Training ulang dari Qdrant...")
+        print("[STARTUP] xgb_reranker.pkl tidak ditemukan. Training ulang dari Qdrant...")
         db_features = []
         db_labels = []
         offset = None
@@ -116,22 +122,58 @@ async def startup_event():
             label_encoder = LabelEncoder()
             y_encoded = label_encoder.fit_transform(db_labels)
             
-            lr_clf = LogisticRegression(max_iter=1000, class_weight='balanced')
-            lr_clf.fit(db_features, y_encoded)
+            xgb_clf = xgb.XGBClassifier(
+                objective="multi:softprob", 
+                eval_metric="mlogloss", 
+                use_label_encoder=False,
+                n_estimators=100,
+                max_depth=6,
+                learning_rate=0.1
+            )
+            xgb_clf.fit(db_features, y_encoded)
             
-            with open("lr_reranker.pkl", "wb") as f:
-                pickle.dump((lr_clf, label_encoder), f)
+            with open("xgb_reranker.pkl", "wb") as f:
+                pickle.dump((xgb_clf, label_encoder), f)
                 
-            print(f"[STARTUP] Logistic Regression reranker trained on {len(db_features)} items and saved.")
+            print(f"[STARTUP] XGBoost reranker trained on {len(db_features)} items and saved.")
         else:
-            print("[WARNING] Qdrant kosong, tidak dapat men-training Logistic Regression.")
-            lr_clf = None
+            print("[WARNING] Qdrant kosong, tidak dapat men-training XGBoost.")
+            xgb_clf = None
             label_encoder = None
 
-    print("[STARTUP] Loading E5 Model & SPLADE for Hybrid Text Search...")
-    e5_model = TextEmbedding(model_name="intfloat/multilingual-e5-large")
-    sparse_model = SparseTextEmbedding(model_name="prithivida/Splade_PP_en_v1")
+    print("[STARTUP] Loading E5 Model for Hybrid Text Search...")
+    e5_model = SentenceTransformer("intfloat/multilingual-e5-base", device=DEVICE)
 
+    print("[STARTUP] Preparing BM25 & E5 Metadata Database from Qdrant...")
+    offset = None
+    while True:
+        records, next_page = qdrant_client.scroll(
+            collection_name=COLLECTION_NAME,
+            limit=500,
+            offset=offset,
+            with_vectors=False, 
+            with_payload=True
+        )
+        for r in records:
+            p = r.payload
+            if p:
+                text_doc = f"{p.get('ProductName','')} {p.get('ProductFunction','')} {p.get('CategoryName','')} {p.get('Tags','')} {p.get('class_name','')} {p.get('ColorName','')} {p.get('ProductVolume','')}ml"
+                db_metadata_docs.append(text_doc.lower())
+                db_qdrant_ids.append(r.id)
+                db_payloads.append(p)
+                
+        if next_page is None:
+            break
+        offset = next_page
+
+    tokenized_docs = [doc.split() for doc in db_metadata_docs]
+    bm25_index = BM25Okapi(tokenized_docs) if tokenized_docs else None
+
+    if db_metadata_docs:
+        e5_passages = [f"passage: {doc}" for doc in db_metadata_docs]
+        e5_vectors = e5_model.encode(e5_passages, convert_to_numpy=True, normalize_embeddings=True)
+
+    print(f"[STARTUP] BM25 and E5 indices ready with {len(db_metadata_docs)} items.")
     print("[STARTUP] All systems ready!")
 
 # =============================================================================
@@ -423,8 +465,8 @@ async def api_search_image(
             
         res = []
         if res_qdrant:
-            if lr_clf is not None and label_encoder is not None:
-                proba = lr_clf.predict_proba(cbir_vec.reshape(1, -1))[0]
+            if xgb_clf is not None and label_encoder is not None:
+                proba = xgb_clf.predict_proba(cbir_vec.reshape(1, -1))[0]
                 class_to_prob = {str(c): float(p) for c, p in zip(label_encoder.classes_, proba)}
                 
                 cos_scores = np.array([r.score for r in res_qdrant], dtype=np.float32)
@@ -477,36 +519,49 @@ async def api_search_text(
         
     try:
         tbir_vec = extract_tbir_vector(text_query)
-        e5_vec = list(e5_model.embed([f"query: {text_query}"]))[0]
-        splade_res = list(sparse_model.embed([text_query]))[0]
-
-        prefetch_tbir = qmodels.Prefetch(
+        
+        # Query ke Qdrant (Visual Text SigLIP)
+        tbir_res = qdrant_client.query_points(
+            collection_name=COLLECTION_NAME,
             query=tbir_vec.tolist(),
             using="tbir",
-            limit=FINAL_K * 2
-        )
-        prefetch_e5 = qmodels.Prefetch(
-            query=e5_vec.tolist(),
-            using="e5_text",
-            limit=FINAL_K * 2
-        )
-        prefetch_splade = qmodels.Prefetch(
-            query=qmodels.SparseVector(
-                indices=splade_res.indices.tolist(),
-                values=splade_res.values.tolist()
-            ),
-            using="splade_text",
-            limit=FINAL_K * 2
-        )
-        
-        # Eksekusi Native Qdrant Fusion
-        res = qdrant_client.query_points(
-            collection_name=COLLECTION_NAME,
-            prefetch=[prefetch_tbir, prefetch_e5, prefetch_splade],
-            query=qmodels.FusionQuery(fusion=qmodels.Fusion.RRF),
-            limit=FINAL_K,
+            limit=50,
+            query_filter=None,
             with_payload=True
         ).points
+            
+        tokenized_query = text_query.lower().split()
+        bm25_scores = bm25_index.get_scores(tokenized_query) if bm25_index else np.zeros(len(db_metadata_docs))
+        
+        e5_vec = e5_model.encode([f"query: {text_query}"], convert_to_numpy=True, normalize_embeddings=True)[0]
+        e5_scores = np.dot(e5_vectors, e5_vec) if e5_vectors is not None else np.zeros(len(db_metadata_docs))
+        
+        bm25_order = np.argsort(-bm25_scores)
+        bm25_ranks = np.zeros(len(bm25_scores), dtype=np.int32)
+        bm25_ranks[bm25_order] = np.arange(1, len(bm25_scores) + 1)
+        
+        e5_order = np.argsort(-e5_scores)
+        e5_ranks = np.zeros(len(e5_scores), dtype=np.int32)
+        e5_ranks[e5_order] = np.arange(1, len(e5_scores) + 1)
+        
+        k_rrf = 60
+        
+        tbir_ranks = np.full(len(db_metadata_docs), len(db_metadata_docs) + 1, dtype=np.int32)
+        id_to_idx = {qid: i for i, qid in enumerate(db_qdrant_ids)}
+        for rank_i, r_p in enumerate(tbir_res):
+            if r_p.id in id_to_idx:
+                tbir_ranks[id_to_idx[r_p.id]] = rank_i + 1
+                
+        rrf_scores = (1.0 / (k_rrf + bm25_ranks)) + (1.0 / (k_rrf + e5_ranks)) + (1.0 / (k_rrf + tbir_ranks))
+            
+        final_order = np.argsort(-rrf_scores)[:FINAL_K]
+        
+        res = []
+        for idx in final_order:
+            q_id = db_qdrant_ids[idx]
+            payload = db_payloads[idx]
+            score = float(rrf_scores[idx])
+            res.append(MockPoint(q_id, score, payload))
 
         if not res:
             return SearchResponse(
