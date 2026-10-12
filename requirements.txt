@@ -12,3 +12,4 @@ sentence-transformers
 rank-bm25
 ultralytics
 qdrant-client
+sentencepiece
