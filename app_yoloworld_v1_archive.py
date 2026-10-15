@@ -1067,4 +1067,4 @@ async def api_search_text(request: Request):
 
 
 if __name__ == "__main__":
-    uvicorn.run("app_yoloworld:app", host="0.0.0.0", port=8000, reload=True)
+    uvicorn.run("app_yoloworld_v1_archive:app", host="0.0.0.0", port=8000, reload=True)
