@@ -194,7 +194,8 @@ dino_model = None
 tbir_tokenizer = None
 tbir_model = None
 qdrant_client = None
-xgb_models: Dict[str, Any] = {}
+lr_models: Dict[str, Any] = {}
+xgb_models = lr_models  # alias backward compatibility
 e5_model = None
 
 db_metadata_docs = []
@@ -247,7 +248,7 @@ def build_structured_product_text(p: dict) -> str:
 @app.on_event("startup")
 async def startup_event():
     global yolo_world_model, dino_model, tbir_tokenizer, tbir_model, qdrant_client
-    global xgb_models, e5_model, db_metadata_docs, db_qdrant_ids, db_payloads
+    global lr_models, xgb_models, e5_model, db_metadata_docs, db_qdrant_ids, db_payloads
     global bm25_index, e5_vectors
 
     print(f"[STARTUP] Device: {DEVICE}")
@@ -285,13 +286,13 @@ async def startup_event():
         print(f"[STARTUP] Connecting to Qdrant Local di '{QDRANT_PATH}'...")
         qdrant_client = QdrantClient(path=QDRANT_PATH)
 
-    # 5. Load / Auto-train XGBoost Rerankers per Type
-    print("[STARTUP] Memeriksa model XGBoost Reranker per Type...")
+    # 5. Load / Auto-train Logistic Regression Rerankers per Type
+    print("[STARTUP] Memeriksa model Logistic Regression Reranker per Type...")
     TYPES_TO_TRAIN = ["bottle", "cup", "tray"]
-    missing_types = [t for t in TYPES_TO_TRAIN if not os.path.exists(f"xgb_model_{t}.pkl")]
+    missing_types = [t for t in TYPES_TO_TRAIN if not os.path.exists(f"lr_model_{t}.pkl")]
 
     if missing_types:
-        print(f"[STARTUP] Model XGBoost untuk Type {missing_types} belum ditemukan di disk.")
+        print(f"[STARTUP] Model Logistic Regression untuk Type {missing_types} belum ditemukan di disk.")
         print("[STARTUP] Mengambil vektor CBIR dari Qdrant Merged untuk melatih model per-type...")
         from collections import defaultdict
         type_train_data = defaultdict(lambda: {"X": [], "y": []})
@@ -320,11 +321,11 @@ async def startup_event():
             offset = next_page
 
         for t in TYPES_TO_TRAIN:
-            model_file = f"xgb_model_{t}.pkl"
+            model_file = f"lr_model_{t}.pkl"
             if os.path.exists(model_file):
                 try:
                     with open(model_file, "rb") as f:
-                        xgb_models[t] = pickle.load(f)
+                        lr_models[t] = pickle.load(f)
                     print(f"[STARTUP] Model existing '{model_file}' berhasil dimuat.")
                     continue
                 except Exception as e:
@@ -341,29 +342,27 @@ async def startup_event():
             n_classes = len(le.classes_)
 
             if n_classes > 1:
-                print(f"[STARTUP] Melatih XGBoost untuk Type '{t}' ({len(X)} sampel, {n_classes} kelas)...")
-                clf = xgb.XGBClassifier(
-                    objective="multi:softprob",
-                    eval_metric="mlogloss",
-                    n_estimators=40,
-                    max_depth=4,
-                    learning_rate=0.1,
-                    n_jobs=4,
-                    tree_method="hist"
+                print(f"[STARTUP] Melatih Logistic Regression untuk Type '{t}' ({len(X)} sampel, {n_classes} kelas)...")
+                clf = LogisticRegression(
+                    class_weight="balanced",
+                    C=1.0,
+                    max_iter=1000,
+                    solver="lbfgs",
+                    n_jobs=4
                 )
                 clf.fit(X, y)
                 with open(model_file, "wb") as f:
                     pickle.dump((clf, le), f)
-                xgb_models[t] = (clf, le)
+                lr_models[t] = (clf, le)
                 print(f"[STARTUP] ✅ Model '{model_file}' berhasil dilatih dan disimpan.")
             else:
                 print(f"[STARTUP] Type '{t}' hanya memiliki {n_classes} kelas, melewati pelatihan (fallback cosine).")
     else:
         for t in TYPES_TO_TRAIN:
-            model_file = f"xgb_model_{t}.pkl"
+            model_file = f"lr_model_{t}.pkl"
             try:
                 with open(model_file, "rb") as f:
-                    xgb_models[t] = pickle.load(f)
+                    lr_models[t] = pickle.load(f)
                 print(f"[STARTUP] Model '{model_file}' berhasil dimuat.")
             except Exception as e:
                 print(f"[STARTUP] Peringatan: Gagal memuat '{model_file}': {e}")
@@ -817,14 +816,14 @@ def execute_cbir_search(contents: bytes, manual_type: Optional[str] = None, filt
             with_payload=True
         ).points
 
-    # 6. Reranking (XGBoost per Type + Cosine Score)
+    # 6. Reranking (Logistic Regression per Type + Cosine Score)
     res = []
     if res_qdrant:
         target_type = filter_type
         if not target_type and res_qdrant:
             target_type = str(res_qdrant[0].payload.get("Type", "")).lower().strip()
 
-        active_model = xgb_models.get(target_type) if target_type else None
+        active_model = lr_models.get(target_type) if target_type else None
 
         if active_model is not None:
             clf_type, le_type = active_model
@@ -846,7 +845,7 @@ def execute_cbir_search(contents: bytes, manual_type: Optional[str] = None, filt
                 for i in range(len(res)):
                     res[i].score = float(final_scores[order[i]])
             except Exception as e:
-                print(f"[CBIR RERANK] Peringatan: Gagal reranking XGBoost ({e}), fallback ke cosine score.")
+                print(f"[CBIR RERANK] Peringatan: Gagal reranking Logistic Regression ({e}), fallback ke cosine score.")
                 res = res_qdrant[:FINAL_K]
         else:
             res = res_qdrant[:FINAL_K]

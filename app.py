@@ -12,6 +12,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List, Optional, Any, Dict
 import uvicorn
+import httpx
 
 from sklearn.linear_model import LogisticRegression
 from sklearn.preprocessing import LabelEncoder
@@ -429,16 +430,25 @@ def format_api_results(res_list) -> List[SearchResult]:
     return api_results
 
 
+class ImageSearchPayload(BaseModel):
+    image: str
+
 @app.post("/search/image", response_model=SearchResponse)
 async def api_search_image(
-    image: UploadFile = File(...)
+    payload: ImageSearchPayload
 ):
     """
-    Endpoint untuk mencari botol menggunakan gambar (CBIR).
-    Menggunakan pipeline: YOLO Seg -> DINOv2 + Shape Feature -> Qdrant (cosine) -> XGBoost Reranker.
+    Menerima URL gambar dari n8n via JSON, mengunduhnya langsung ke RAM,
+    lalu memproses CBIR (YOLO -> DINOv2 -> Qdrant -> XGBoost).
     """
     try:
-        contents = await image.read()
+        # Download gambar langsung dari URL CDN/n8n ke memori
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.get(payload.image)
+            if resp.status_code != 200:
+                raise HTTPException(status_code=400, detail="Gagal mengunduh gambar dari URL CDN.")
+            contents = resp.content
+
         np_arr = np.frombuffer(contents, np.uint8)
         input_img_bgr = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
         if input_img_bgr is None:
